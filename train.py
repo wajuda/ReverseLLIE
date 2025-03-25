@@ -8,7 +8,8 @@ from utils.dataset import get_data_loader_folder
 from utils.utils import prepare_sub_folder, write_2images, write_html, print_params, adjust_learning_rate
 from utils.MattingLaplacian import laplacian_loss_grad
 from utils.losses import MSELoss
-
+from utils.psnr_ssim import calculate_psnr,calculate_ssim, calculate_tuple
+from tqdm import tqdm
 torch.backends.cudnn.benchmark = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -19,9 +20,13 @@ parser.add_argument('--mode', type=str, default='llie')
 #parser.add_argument('--vgg_ckpoint', type=str, default='checkpoints/vgg_normalised.pth')
 
 # Dataset
-parser.add_argument('--train_content', default='/home/wenlinfeng/Downloads/unlabeled2017', help='Directory to dataset A')
-parser.add_argument('--train_style', default='/home/wenlinfeng/Downloads/unlabeled2017', help='Directory to dataset B')
-parser.add_argument('--train_target', default='../../', help='Directory to dataset B')
+parser.add_argument('--train_content', default='../../LOLv1/Train/input', help='Directory to dataset A')
+parser.add_argument('--train_style', default='../../LOLv1/Train/target', help='Directory to dataset B')
+parser.add_argument('--train_target', default='../../LOLv1/Train/target', help='Directory to dataset B')
+
+parser.add_argument('--eval_content', default='../../LOLv1/Test/input', help='Directory to dataset A')
+parser.add_argument('--eval_style', default='../../LOLv1/Test/target', help='Directory to dataset B')
+parser.add_argument('--eval_target', default='../../LOLv1/Test/target', help='Directory to dataset B')
 parser.add_argument('--batch_size', type=int, default=2)
 parser.add_argument('--new_size', type=int, default=512)
 parser.add_argument('--crop_size', type=int, default=256)
@@ -39,247 +44,266 @@ parser.add_argument('--lr_decay', type=float, default=5e-5)
 #parser.add_argument('--rec_weight', type=float, default=10)
 #parser.add_argument('--temporal_weight', type=float, default=60)
 
-parser.add_argument('--training_iterations', type=int, default=160000)
+parser.add_argument('--training_iterations', type=int, default=16000) #160000
 parser.add_argument('--fine_tuning_iterations', type=int, default=10000)
 parser.add_argument("--resume", action="store_true", default=False)
 parser.add_argument('--resume_iter', type=int, default=-1)
 
 # Log
 parser.add_argument('--logs_directory', default='logs', help='Directory to log')
-parser.add_argument('--display_size', type=int, default=16)
-parser.add_argument('--image_display_iter', type=int, default=1000)
-parser.add_argument('--image_save_iter', type=int, default=10000)
-parser.add_argument('--model_save_interval', type=int, default=10000)
+parser.add_argument('--display_size', type=int, default=15)
+parser.add_argument('--eval_iter', type=int, default=1000)
+#parser.add_argument('--image_save_iter', type=int, default=10000) #10000
+parser.add_argument('--model_save_interval', type=int, default=4000) #10000
+#parser.add_argument('--eval_iter', type=int, default=1000)
 
-args = parser.parse_args()
-if args.base_name is None:
-    args.base_name = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-total_iterations = args.training_iterations + args.fine_tuning_iterations
-current_iter = -1
+if __name__ =="__main__":
+    args = parser.parse_args()
+    if args.base_name is None:
+        args.base_name = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    # total_iterations = args.training_iterations + args.fine_tuning_iterations
+    total_iterations = args.training_iterations
+    current_iter = -1
 
+    # Logs directory
+    logs_directory = os.path.join(args.logs_directory, args.base_name)
+    print("Logs directory:", logs_directory)
+    checkpoint_directory, image_directory = prepare_sub_folder(logs_directory)
 
-# Logs directory
-logs_directory = os.path.join(args.logs_directory, args.base_name)
-print("Logs directory:", logs_directory)
-checkpoint_directory, image_directory = prepare_sub_folder(logs_directory)
+    # Dataset
+    batch_size = args.batch_size
+    num_workers = args.batch_size
+    new_size = args.new_size
+    crop_size = args.crop_size
+    win_rad = args.win_rad
+    train_loader_a = get_data_loader_folder(args.train_content, batch_size, new_size, crop_size, crop_size,
+                                            use_lap=False, seed=42, num_workers=1)
+    train_loader_c = get_data_loader_folder(args.train_style, batch_size, new_size, crop_size, crop_size, use_lap=False,
+                                            seed=42, num_workers=1)
+    train_loader_b = get_data_loader_folder(args.train_style, batch_size, new_size, crop_size, crop_size, use_lap=False,
+                                            seed=1, num_workers=1, shuffle=True)
 
+    test_loader_a = get_data_loader_folder(args.eval_content, 1, new_size, crop_size, crop_size, use_lap=False,
+                                           seed=42, num_workers=1)
+    test_loader_c = get_data_loader_folder(args.eval_style, 1, new_size, crop_size, crop_size, use_lap=False,
+                                           seed=42, num_workers=1)
+    test_loader_b = get_data_loader_folder(args.eval_style, 1, new_size, crop_size, crop_size, use_lap=False,
+                                           seed=1, num_workers=1)
 
-# Dataset
-batch_size = args.batch_size
-num_workers = args.batch_size
-new_size = args.new_size
-crop_size = args.crop_size
-win_rad = args.win_rad
-train_loader_a = get_data_loader_folder(args.train_content, batch_size, new_size, crop_size, crop_size, use_lap=True, win_rad=win_rad)
-train_loader_c = get_data_loader_folder(args.train_content, batch_size, new_size, crop_size, crop_size, use_lap=True, win_rad=win_rad)
-train_loader_b = get_data_loader_folder(args.train_style, batch_size, new_size, crop_size, crop_size, use_lap=False)
+    # Reversible Network
+    from models.RevResNet import RevResNet
 
+    if args.mode.lower() == "llie":
+        RevNetwork = RevResNet(nBlocks=[10, 10, 10], nStrides=[1, 2, 2], nChannels=[16, 64, 256], in_channel=3, mult=4,
+                               hidden_dim=16, sp_steps=2)
+    elif args.mode.lower() == "artistic":
+        RevNetwork = RevResNet(nBlocks=[10, 10, 10], nStrides=[1, 2, 2], nChannels=[16, 64, 256], in_channel=3, mult=4,
+                               hidden_dim=64, sp_steps=1)
+    else:
+        raise NotImplementedError()
 
-# Reversible Network
-from models.RevResNet import RevResNet
-if args.mode.lower() == "llie":
-    RevNetwork = RevResNet(nBlocks=[10, 10, 10], nStrides=[1, 2, 2], nChannels=[16, 64, 256], in_channel=3, mult=4, hidden_dim=16, sp_steps=2)
-elif args.mode.lower() == "artistic":
-    RevNetwork = RevResNet(nBlocks=[10, 10, 10], nStrides=[1, 2, 2], nChannels=[16, 64, 256], in_channel=3, mult=4, hidden_dim=64, sp_steps=1)
-else:
-    raise NotImplementedError()
-
-RevNetwork = RevNetwork.to(device)
-RevNetwork.train()
-print_params(RevNetwork)
-
-# Optimizer
-optimizer = torch.optim.Adam(RevNetwork.parameters(), lr=args.lr)
-
-
-# Transfer module
-from models.cWCT import cWCT
-cwct = cWCT(train_mode=True)
-
-
-# VGG for style loss
-'''from models.VGG import VGG19
-vgg_enc = VGG19(args.vgg_ckpoint)
-# encoder = nn.DataParallel(encoder)
-vgg_enc.to(device)'''
-
-
-# Resume
-if args.resume:
-    state_dict = torch.load(os.path.join(checkpoint_directory, "last.pt"))
-    RevNetwork.load_state_dict(state_dict['state_dict'])
-    optimizer.load_state_dict(state_dict['optimizer'])
-    current_iter = args.resume_iter
-    print('Resume from %s. Resume iter is %d' % (os.path.join(checkpoint_directory, "last.pt"), args.resume_iter))
-
-
-# Loss
-'''l1_loss = torch.nn.L1Loss()
-if args.temporal_weight > 0:
-    from utils.TemporalLoss import TemporalLoss
-    Temporal_loss = TemporalLoss()'''
-
-
-# Training
-iter_loader_a, iter_loader_b, iter_loader_c = iter(train_loader_a), iter(train_loader_b), iter(train_loader_c)
-
-while current_iter < total_iterations:
-    images_a, images_b, images_c = next(iter_loader_a), next(iter_loader_b), next(iter_loader_c)
-
-    '''lap_list = []
-    if args.lap_weight > 0:
-        for M in images_a['laplacian_m']:
-            indices = torch.from_numpy(np.vstack((M.row, M.col))).long().to(device)
-            values = torch.from_numpy(M.data).to(device)
-            shape = torch.Size(M.shape)
-            laplacian_m = torch.sparse_coo_tensor(indices, values, shape, device=device)
-            lap_list.append(laplacian_m)'''
-
-    images_a, images_b,  images_c = images_a['img'].to(device), images_b['img'].to(device), images_c['img'].to(device)
+    RevNetwork = RevNetwork.to(device)
+    RevNetwork.train()
+    print_params(RevNetwork)
 
     # Optimizer
-    adjust_learning_rate(optimizer, args.lr, args.lr_decay, current_iter)
-    optimizer.zero_grad()
+    optimizer = torch.optim.Adam(RevNetwork.parameters(), lr=args.lr)
 
-    # Forward inference
-    z_c = RevNetwork(images_a, forward=True)
-    z_s = RevNetwork(images_b, forward=True)
+    # Transfer module
+    from models.cWCT import cWCT
 
-    # Transfer
-    try:
-        z_cs = cwct.transfer(z_c, z_s)
-    except:
-        print('Cholesky Decomposition fails. Gradient infinity. Skip current batch.')
-        with open(logs_directory + "/loss.log", "a") as log_file:
-            log_file.write('Cholesky Decomposition fails. Gradient infinity. Skip current batch. \n')
-        continue
+    cwct = cWCT(train_mode=True)
 
-    # Backward inference
-    stylized = RevNetwork(z_cs, forward=False)
+    # VGG for style loss
+    '''from models.VGG import VGG19
+    vgg_enc = VGG19(args.vgg_ckpoint)
+    # encoder = nn.DataParallel(encoder)
+    vgg_enc.to(device)'''
+
+    # Resume
+    if args.resume:
+        state_dict = torch.load(os.path.join(checkpoint_directory, "last.pt"))
+        RevNetwork.load_state_dict(state_dict['state_dict'])
+        optimizer.load_state_dict(state_dict['optimizer'])
+        current_iter = args.resume_iter
+        print('Resume from %s. Resume iter is %d' % (os.path.join(checkpoint_directory, "last.pt"), args.resume_iter))
+
+    # Loss
+    '''l1_loss = torch.nn.L1Loss()
+    if args.temporal_weight > 0:
+        from utils.TemporalLoss import TemporalLoss
+        Temporal_loss = TemporalLoss()'''
+
+    # Training
+    iter_loader_a, iter_loader_b, iter_loader_c = iter(train_loader_a), iter(train_loader_b), iter(train_loader_c)
+
+    mseloss = MSELoss()
 
 
-    # Style loss
-    '''loss_c, loss_s = vgg_enc(images_a, images_b, stylized, n_layer=4, content_weight=args.content_weight)'''
+    while current_iter < total_iterations:
+        images_a, images_b, images_c = next(iter_loader_a), next(iter_loader_b), next(iter_loader_c)
 
-    # Cycle reconstruction
-    '''if args.rec_weight > 0:
-        z_cs = RevNetwork(stylized, forward=True)
+        '''lap_list = []
+        if args.lap_weight > 0:
+            for M in images_a['laplacian_m']:
+                indices = torch.from_numpy(np.vstack((M.row, M.col))).long().to(device)
+                values = torch.from_numpy(M.data).to(device)
+                shape = torch.Size(M.shape)
+                laplacian_m = torch.sparse_coo_tensor(indices, values, shape, device=device)
+                lap_list.append(laplacian_m)'''
 
+        images_a, images_b, images_c = images_a['img'].to(device), images_b['img'].to(device), images_c['img'].to(
+            device)
+
+        # Optimizer
+        adjust_learning_rate(optimizer, args.lr, args.lr_decay, current_iter)
+        optimizer.zero_grad()
+
+        # Forward inference
+        z_c = RevNetwork(images_a, forward=True)
+        z_s = RevNetwork(images_b, forward=True)
+
+        # Transfer
         try:
-            z_csc = cwct.transfer(z_cs, z_c)
+            z_cs = cwct.transfer(z_c, z_s)
         except:
             print('Cholesky Decomposition fails. Gradient infinity. Skip current batch.')
             with open(logs_directory + "/loss.log", "a") as log_file:
                 log_file.write('Cholesky Decomposition fails. Gradient infinity. Skip current batch. \n')
             continue
 
-        rec = RevNetwork(z_csc, forward=False)
-        loss_rec = l1_loss(rec, images_a)
-    else:
-        loss_rec = 0'''
+        # Backward inference
+        stylized = RevNetwork(z_cs, forward=False)
 
-    # Matting Laplacian loss
-    '''if args.lap_weight > 0:
-        bn = stylized.size(0)
-        lap_loss = list()
-        grad = list()
-        for i in range(bn):
-            l, g = laplacian_loss_grad(stylized[i], lap_list[i])
-            lap_loss.append(l)
-            grad.append(g)
-        grad = torch.stack(grad, dim=0)
-        grad = grad * args.lap_weight
-        grad = grad.clamp(-0.05, 0.05)
-        stylized.backward(grad, retain_graph=True)  # We can directly backward gradient
+        # Style loss
+        '''loss_c, loss_s = vgg_enc(images_a, images_b, stylized, n_layer=4, content_weight=args.content_weight)'''
 
-        loss_lap = torch.mean(torch.stack(lap_loss, dim=0))
-    else:
-        loss_lap = 0'''
+        # Cycle reconstruction
+        '''if args.rec_weight > 0:
+            z_cs = RevNetwork(stylized, forward=True)
 
-    # Temporal loss
-    '''  if args.temporal_weight > 0 and current_iter > args.training_iterations:
-        SecondFrame, ForwardFlow = Temporal_loss.GenerateFakeData(images_a)
-        z_c2 = RevNetwork(SecondFrame, forward=True)
+            try:
+                z_csc = cwct.transfer(z_cs, z_c)
+            except:
+                print('Cholesky Decomposition fails. Gradient infinity. Skip current batch.')
+                with open(logs_directory + "/loss.log", "a") as log_file:
+                    log_file.write('Cholesky Decomposition fails. Gradient infinity. Skip current batch. \n')
+                continue
 
-        try:
-            z_cs2 = cwct.transfer(z_c2, z_s)
-        except:
-            print('Cholesky Decomposition fails. Gradient infinity. Skip current batch.')
+            rec = RevNetwork(z_csc, forward=False)
+            loss_rec = l1_loss(rec, images_a)
+        else:
+            loss_rec = 0'''
+
+        # Matting Laplacian loss
+        '''if args.lap_weight > 0:
+            bn = stylized.size(0)
+            lap_loss = list()
+            grad = list()
+            for i in range(bn):
+                l, g = laplacian_loss_grad(stylized[i], lap_list[i])
+                lap_loss.append(l)
+                grad.append(g)
+            grad = torch.stack(grad, dim=0)
+            grad = grad * args.lap_weight
+            grad = grad.clamp(-0.05, 0.05)
+            stylized.backward(grad, retain_graph=True)  # We can directly backward gradient
+
+            loss_lap = torch.mean(torch.stack(lap_loss, dim=0))
+        else:
+            loss_lap = 0'''
+
+        # Temporal loss
+        '''  if args.temporal_weight > 0 and current_iter > args.training_iterations:
+            SecondFrame, ForwardFlow = Temporal_loss.GenerateFakeData(images_a)
+            z_c2 = RevNetwork(SecondFrame, forward=True)
+
+            try:
+                z_cs2 = cwct.transfer(z_c2, z_s)
+            except:
+                print('Cholesky Decomposition fails. Gradient infinity. Skip current batch.')
+                with open(logs_directory + "/loss.log", "a") as log_file:
+                    log_file.write('Cholesky Decomposition fails. Gradient infinity. Skip current batch. \n')
+                continue
+
+            stylizedSecondFrame = RevNetwork(z_cs2, forward=False)
+
+            loss_tmp, FakeStyledSecondFrame_1 = Temporal_loss(stylized, stylizedSecondFrame, ForwardFlow)
+
+            loss_tmp_GT, _ = Temporal_loss(images_a, SecondFrame, ForwardFlow)
+        else:
+            loss_tmp = 0
+            loss_tmp_GT = 0.'''
+
+        # Total loss
+        # loss = args.content_weight * loss_c + args.style_weight * loss_s + args.rec_weight * loss_rec + args.temporal_weight * loss_tmp
+        loss = mseloss(stylized, images_c)
+        loss.backward()
+        nn.utils.clip_grad_norm_(RevNetwork.parameters(), 5)
+        optimizer.step()
+
+        # Dump training stats in log file
+        if (current_iter + 1) % 10 == 0:
+            message = "Iteration: %08d/%08d  loss:%.4f" % (
+                # "Iteration: %08d/%08d  content_loss:%.4f  lap_loss:%.4f  rec_loss:%.4f  style_loss:%.4f  loss_tmp:%.4f  loss_tmp_GT:%.4f" % (
+                current_iter + 1, total_iterations,
+                loss
+                # args.content_weight * loss_c,
+                # args.lap_weight * loss_lap,
+                # args.rec_weight * loss_rec,
+                # args.style_weight * loss_s,
+                # args.temporal_weight * loss_tmp,
+                # args.temporal_weight * loss_tmp_GT,
+            )
+            print(message)
             with open(logs_directory + "/loss.log", "a") as log_file:
-                log_file.write('Cholesky Decomposition fails. Gradient infinity. Skip current batch. \n')
-            continue
+                log_file.write('%s\n' % message)
 
-        stylizedSecondFrame = RevNetwork(z_cs2, forward=False)
+            # Log sample
+            if (current_iter + 1) % args.eval_iter == 0:
+                cwct.train_mode = False
+                with torch.no_grad():
+                    # index = torch.randint(low=0, high=len(test_loader_a.dataset), size=[args.display_size])
+                    index = len(test_loader_a.dataset)
+                    test_display_images_a = torch.stack([test_loader_a.dataset[i]['img'] for i in range(index)])
+                    # index = torch.randint(low=0, high=len(test_loader_b.dataset), size=[args.display_size])
+                    test_display_images_b = torch.stack([test_loader_b.dataset[i-1]['img'] for i in range(index)])
+                    test_display_images_c = torch.stack([test_loader_b.dataset[i]['img'] for i in range(index)])
+                    test_image_outputs = RevNetwork.sample(cwct, test_display_images_a, test_display_images_b, device)
+                    #print(type(test_image_outputs))
+                eval_psnr = calculate_tuple(test_image_outputs[2], test_display_images_c, 'psnr')
+                eval_ssim = calculate_tuple(test_image_outputs[2], test_display_images_c, 'ssim')
+                #eval_psnr = calculate_psnr(test_image_outputs, test_display_images_c)
+                #eval_ssim = calculate_ssim(test_image_outputs, test_display_images_c)
+                print(f'Iteration {current_iter + 1} eval loss:psnr {eval_psnr},ssim {eval_ssim}')
+                cwct.train_mode = True
+                write_2images(test_image_outputs, args.display_size, image_directory, 'train_%08d' % (current_iter + 1))
+                # HTML
+                write_html(logs_directory + "/index.html", current_iter + 1, args.eval_iter, 'images')
 
-        loss_tmp, FakeStyledSecondFrame_1 = Temporal_loss(stylized, stylizedSecondFrame, ForwardFlow)
+            '''if (current_iter + 1) % args.image_display_iter == 0:
+                cwct.train_mode = False
+                with torch.no_grad():
+                    index = torch.randint(low=0, high=len(train_loader_a.dataset), size=[args.display_size])
+                    train_display_images_a = torch.stack([train_loader_a.dataset[i]['img'] for i in index])
+                    index = torch.randint(low=0, high=len(train_loader_b.dataset), size=[args.display_size])
+                    train_display_images_b = torch.stack([train_loader_b.dataset[i]['img'] for i in index])
+                    image_outputs = RevNetwork.sample(cwct, train_display_images_a, train_display_images_b, device)
+                cwct.train_mode = True
+                write_2images(image_outputs, args.display_size, image_directory, 'train_current')'''
 
-        loss_tmp_GT, _ = Temporal_loss(images_a, SecondFrame, ForwardFlow)
-    else:
-        loss_tmp = 0
-        loss_tmp_GT = 0.'''
+            # Save network weights
+            if (current_iter + 1) % args.model_save_interval == 0:
+                ckpoint_file = os.path.join(checkpoint_directory, f'{current_iter + 1}.pt')
+                torch.save({'state_dict': RevNetwork.state_dict(), 'optimizer': optimizer.state_dict()}, ckpoint_file)
 
+            if (current_iter + 1) == args.training_iterations:
+                ckpoint_file = os.path.join(checkpoint_directory, 'model_LLIE.pt')
+                torch.save({'state_dict': RevNetwork.state_dict()}, ckpoint_file)
+            '''elif (current_iter + 1) == total_iterations:
+                ckpoint_file = os.path.join(checkpoint_directory, 'model_video.pt')
+                torch.save({'state_dict': RevNetwork.state_dict()}, ckpoint_file)'''
 
-    # Total loss
-    #loss = args.content_weight * loss_c + args.style_weight * loss_s + args.rec_weight * loss_rec + args.temporal_weight * loss_tmp
-    loss = MSELoss(stylized, images_c)
-    loss.backward()
-    nn.utils.clip_grad_norm_(RevNetwork.parameters(), 5)
-    optimizer.step()
+        current_iter += 1
 
-
-    # Dump training stats in log file
-    if (current_iter + 1) % 10 == 0:
-        message = "Iteration: %08d/%08d  loss:%.4f" % (#"Iteration: %08d/%08d  content_loss:%.4f  lap_loss:%.4f  rec_loss:%.4f  style_loss:%.4f  loss_tmp:%.4f  loss_tmp_GT:%.4f" % (
-            current_iter + 1, total_iterations,
-            loss
-            #args.content_weight * loss_c,
-            #args.lap_weight * loss_lap,
-            #args.rec_weight * loss_rec,
-            #args.style_weight * loss_s,
-            #args.temporal_weight * loss_tmp,
-            #args.temporal_weight * loss_tmp_GT,
-        )
-        print(message)
-        with open(logs_directory + "/loss.log", "a") as log_file:
-            log_file.write('%s\n' % message)
-
-        # Log sample
-        if (current_iter + 1) % args.image_save_iter == 0:
-            cwct.train_mode = False
-            with torch.no_grad():
-                index = torch.randint(low=0, high=len(train_loader_a.dataset), size=[args.display_size])
-                train_display_images_a = torch.stack([train_loader_a.dataset[i]['img'] for i in index])
-                index = torch.randint(low=0, high=len(train_loader_b.dataset), size=[args.display_size])
-                train_display_images_b = torch.stack([train_loader_b.dataset[i]['img'] for i in index])
-                train_image_outputs = RevNetwork.sample(cwct, train_display_images_a, train_display_images_b, device)
-            cwct.train_mode = True
-            write_2images(train_image_outputs, args.display_size, image_directory, 'train_%08d' % (current_iter + 1))
-            # HTML
-            write_html(logs_directory + "/index.html", current_iter + 1, args.image_save_iter, 'images')
-
-        if (current_iter + 1) % args.image_display_iter == 0:
-            cwct.train_mode = False
-            with torch.no_grad():
-                index = torch.randint(low=0, high=len(train_loader_a.dataset), size=[args.display_size])
-                train_display_images_a = torch.stack([train_loader_a.dataset[i]['img'] for i in index])
-                index = torch.randint(low=0, high=len(train_loader_b.dataset), size=[args.display_size])
-                train_display_images_b = torch.stack([train_loader_b.dataset[i]['img'] for i in index])
-                image_outputs = RevNetwork.sample(cwct, train_display_images_a, train_display_images_b, device)
-            cwct.train_mode = True
-            write_2images(image_outputs, args.display_size, image_directory, 'train_current')
-
-        # Save network weights
-        if (current_iter + 1) % args.model_save_interval == 0:
-            ckpoint_file = os.path.join(checkpoint_directory, 'last.pt')
-            torch.save({'state_dict': RevNetwork.state_dict(), 'optimizer': optimizer.state_dict()}, ckpoint_file)
-
-        if (current_iter + 1) == args.training_iterations:
-            ckpoint_file = os.path.join(checkpoint_directory, 'model_image.pt')
-            torch.save({'state_dict': RevNetwork.state_dict()}, ckpoint_file)
-        elif (current_iter + 1) == total_iterations:
-            ckpoint_file = os.path.join(checkpoint_directory, 'model_video.pt')
-            torch.save({'state_dict': RevNetwork.state_dict()}, ckpoint_file)
-
-    current_iter += 1
-
-print("Finishing training. Model save at %s" % checkpoint_directory)
+    print("Finishing training. Model save at %s" % checkpoint_directory)

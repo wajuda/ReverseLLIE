@@ -114,7 +114,10 @@ def collate_fn(batch):
     return {'img': img, 'laplacian_m': laplacian_m}
 
 
-def get_data_loader_folder(input_folder, batch_size, new_size=288, height=256, width=256, use_lap=False, win_rad=1, num_workers=None):
+def get_data_loader_folder(input_folder, batch_size, new_size=288, height=256, width=256, use_lap=False, win_rad=1, num_workers=None, seed =42, shuffle=False):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
     transform_list = []
     transform_list = [transforms.RandomCrop((height, width))] + transform_list
     transform_list = [transforms.Resize(new_size)] + transform_list
@@ -122,8 +125,8 @@ def get_data_loader_folder(input_folder, batch_size, new_size=288, height=256, w
     dataset = ImageFolder(input_folder, transform=transform, use_lap=use_lap, win_rad=win_rad)
     
     if num_workers is None:
-        num_workers = 2*batch_size
-    loader = DataLoader(dataset=dataset, batch_size=batch_size, drop_last=True, num_workers=num_workers, sampler=InfiniteSamplerWrapper(dataset), collate_fn=collate_fn)
+        num_workers = 2*batch_size #InfiniteSamplerWrapper(dataset)
+    loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True, num_workers=num_workers, sampler=None, collate_fn=collate_fn)
     return loader
 
 
