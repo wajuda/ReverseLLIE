@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 import datetime
+
+from torch.nn.functional import mse_loss
+
 from utils.dataset import get_data_loader_folder
 from utils.utils import prepare_sub_folder, write_2images, write_html, print_params, adjust_learning_rate
 from utils.MattingLaplacian import laplacian_loss_grad
@@ -32,7 +35,7 @@ parser.add_argument('--new_size', type=int, default=512)
 parser.add_argument('--crop_size', type=int, default=256)
 
 #parser.add_argument('--use_lap', type=bool, default=True)
-parser.add_argument('--win_rad', type=int, default=1, help='The larger the value, the more detail in the generated image and the higher the CPU and memory requirements (proportional to the win_rad**2)')
+#parser.add_argument('--win_rad', type=int, default=1, help='The larger the value, the more detail in the generated image and the higher the CPU and memory requirements (proportional to the win_rad**2)')
 
 # Training options
 parser.add_argument('--lr', type=float, default=1e-4)
@@ -41,7 +44,7 @@ parser.add_argument('--lr_decay', type=float, default=5e-5)
 #parser.add_argument('--style_weight', type=float, default=1)
 #parser.add_argument('--content_weight', type=float, default=0)
 #parser.add_argument('--lap_weight', type=float, default=1500)
-#parser.add_argument('--rec_weight', type=float, default=10)
+parser.add_argument('--rec_weight', type=float, default=0)
 #parser.add_argument('--temporal_weight', type=float, default=60)
 
 parser.add_argument('--training_iterations', type=int, default=16000) #160000
@@ -75,7 +78,7 @@ if __name__ =="__main__":
     num_workers = args.batch_size
     new_size = args.new_size
     crop_size = args.crop_size
-    win_rad = args.win_rad
+    #win_rad = args.win_rad
     train_loader_a = get_data_loader_folder(args.train_content, batch_size, new_size, crop_size, crop_size,
                                             use_lap=False, seed=42, num_workers=1)
     train_loader_c = get_data_loader_folder(args.train_style, batch_size, new_size, crop_size, crop_size, use_lap=False,
@@ -120,13 +123,14 @@ if __name__ =="__main__":
     # encoder = nn.DataParallel(encoder)
     vgg_enc.to(device)'''
 
-    # Resume
+    # Resume 使用预训练参数对LLIE任务微调
     if args.resume:
-        state_dict = torch.load(os.path.join(checkpoint_directory, "last.pt"))
+        #state_dict = torch.load(os.path.join(checkpoint_directory, "last.pt"))
+        state_dict = torch.load('./checkpoints/photo_image.pt')
         RevNetwork.load_state_dict(state_dict['state_dict'])
         optimizer.load_state_dict(state_dict['optimizer'])
         current_iter = args.resume_iter
-        print('Resume from %s. Resume iter is %d' % (os.path.join(checkpoint_directory, "last.pt"), args.resume_iter))
+        print('Resume from %s. Resume iter is %d' % ('./checkpoints/photo_image.pt', args.resume_iter))
 
     # Loss
     '''l1_loss = torch.nn.L1Loss()
@@ -179,7 +183,7 @@ if __name__ =="__main__":
         '''loss_c, loss_s = vgg_enc(images_a, images_b, stylized, n_layer=4, content_weight=args.content_weight)'''
 
         # Cycle reconstruction
-        '''if args.rec_weight > 0:
+        if args.rec_weight > 0:
             z_cs = RevNetwork(stylized, forward=True)
 
             try:
@@ -191,9 +195,9 @@ if __name__ =="__main__":
                 continue
 
             rec = RevNetwork(z_csc, forward=False)
-            loss_rec = l1_loss(rec, images_a)
+            loss_rec = mse_loss(rec, images_a)
         else:
-            loss_rec = 0'''
+            loss_rec = 0
 
         # Matting Laplacian loss
         '''if args.lap_weight > 0:
@@ -237,17 +241,20 @@ if __name__ =="__main__":
 
         # Total loss
         # loss = args.content_weight * loss_c + args.style_weight * loss_s + args.rec_weight * loss_rec + args.temporal_weight * loss_tmp
-        loss = mseloss(stylized, images_c)
+        enhance_loss = mse_loss(stylized, images_a)
+        loss = enhance_loss + args.rec_weight * loss_rec
         loss.backward()
         nn.utils.clip_grad_norm_(RevNetwork.parameters(), 5)
         optimizer.step()
 
         # Dump training stats in log file
         if (current_iter + 1) % 10 == 0:
-            message = "Iteration: %08d/%08d  loss:%.4f" % (
+            message = "Iteration: %08d/%08d  loss:%.4f enhance_loss:%.4f rec_loss:%.4f" % (
                 # "Iteration: %08d/%08d  content_loss:%.4f  lap_loss:%.4f  rec_loss:%.4f  style_loss:%.4f  loss_tmp:%.4f  loss_tmp_GT:%.4f" % (
                 current_iter + 1, total_iterations,
-                loss
+                loss,
+                enhance_loss,
+                loss_rec
                 # args.content_weight * loss_c,
                 # args.lap_weight * loss_lap,
                 # args.rec_weight * loss_rec,
