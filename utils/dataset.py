@@ -1,4 +1,4 @@
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import torch.utils.data as data
 import os.path
 import random
@@ -7,6 +7,8 @@ from PIL import Image
 import torch
 from PIL import ImageFile
 from utils.MattingLaplacian import compute_laplacian
+from torchvision.datasets import ImageFolder
+
 
 import numpy as np
 
@@ -37,7 +39,7 @@ def make_dataset(dir):
     return images
 
 
-class ImageFolder(data.Dataset):
+'''class ImageFolder(data.Dataset):
 
     def __init__(self, root, transform=None, use_lap=False, win_rad=1):
         imgs = []
@@ -78,7 +80,7 @@ class ImageFolder(data.Dataset):
         return {'img': img, 'laplacian_m': laplacian_m}
 
     def __len__(self):
-        return self._length
+        return self._length'''
 
 
 def InfiniteSampler(n):
@@ -133,4 +135,76 @@ def get_data_loader_folder(input_folder, batch_size, new_size=None, height=256, 
     loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True, num_workers=num_workers, sampler=None, collate_fn=collate_fn)
     return loader
 
+
+class PairedImageDataset(Dataset):
+    def __init__(self, folder1, folder2, transform=None, extensions=('jpg', 'jpeg', 'png')):
+        self.folder1 = folder1
+        self.folder2 = folder2
+        self.transform = transform
+
+        # 获取两个文件夹中的图片文件名（确保匹配）
+        self.files1 = sorted([f for f in os.listdir(folder1) if f.lower().endswith(extensions)])
+        self.files2 = sorted([f for f in os.listdir(folder2) if f.lower().endswith(extensions)])
+
+        # 确保两个文件夹中的文件数量相同且文件名匹配（可根据需要调整）
+        assert len(self.files1) == len(self.files2), "两个文件夹中的图片数量必须相同"
+        if len(self.files1) > 100:  # 只检查前100个文件（避免耗时）
+            assert all(f1 == f2 for f1, f2 in zip(self.files1[:100], self.files2[:100])), "文件名不匹配"
+
+    def __len__(self):
+        return len(self.files1)
+
+    def __getitem__(self, idx):
+        img1 = Image.open(os.path.join(self.folder1, self.files1[idx])).convert('RGB')
+        img2 = Image.open(os.path.join(self.folder2, self.files2[idx])).convert('RGB')
+
+        if self.transform is not None:
+            # 确保两个图片使用相同的随机变换（如裁剪位置）
+            seed = random.randint(0, 2 ** 32)
+
+            random.seed(seed)
+            torch.manual_seed(seed)
+            img1 = self.transform(img1)
+
+            random.seed(seed)
+            torch.manual_seed(seed)
+            img2 = self.transform(img2)
+
+        return {'content':img1, 'style':img2}
+
+def get_paired_data_loader(
+        input_folder1,
+        input_folder2,
+        batch_size,
+        new_size=None,
+        height=256,
+        width=256,
+        num_workers=None,
+        shuffle=False
+):
+    if new_size:
+        transform_list = [
+            transforms.Resize(new_size),
+            transforms.RandomCrop((height, width)),
+            transforms.ToTensor()
+        ]
+    else:
+        transform_list = [transforms.ToTensor()]
+
+    transform = transforms.Compose(transform_list)
+
+    dataset = PairedImageDataset(input_folder1, input_folder2, transform=transform)
+
+    if num_workers is None:
+        num_workers = min(4, os.cpu_count())  # 合理设置workers数量
+
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=True
+    )
+
+    return loader
 
